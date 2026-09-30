@@ -1,0 +1,146 @@
+<#
+  ServiceRestartDashboard.ps1
+  Small WinForms GUI: restarts one primary service first, waits until it is Running,
+  then restarts the remaining services. If the primary fails, the others are left alone.
+
+  Run as an account with admin rights on the target server.
+  Remote targets need WinRM (PowerShell remoting) enabled.
+#>
+
+# ---------------- Configure these ----------------
+$Computer       = $env:COMPUTERNAME            # e.g. 'APPSERVER01'
+$Primary        = 'PrimaryServiceName'         # service name (not display name)
+$Others         = @('ServiceA', 'ServiceB', 'ServiceC')
+$TimeoutSeconds = 120                          # how long to wait for the primary to reach Running
+# -------------------------------------------------
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+$IsLocal = $Computer -in @($env:COMPUTERNAME, 'localhost', '.')
+
+function Invoke-Target([scriptblock]$Block, [object[]]$Arguments) {
+    if ($IsLocal) { & $Block @Arguments }
+    else { Invoke-Command -ComputerName $Computer -ScriptBlock $Block -ArgumentList $Arguments -ErrorAction Stop }
+}
+
+function New-Point($x, $y) { New-Object System.Drawing.Point($x, $y) }
+function New-Size($w, $h)  { New-Object System.Drawing.Size($w, $h) }
+
+# ---------------- Layout ----------------
+$form               = New-Object System.Windows.Forms.Form
+$form.Text          = "Service Restart - $Computer"
+$form.Size          = New-Size 580 500
+$form.StartPosition = 'CenterScreen'
+$form.Font          = New-Object System.Drawing.Font('Segoe UI', 10)
+$form.FormBorderStyle = 'FixedDialog'
+$form.MaximizeBox   = $false
+
+$list               = New-Object System.Windows.Forms.ListView
+$list.View          = 'Details'
+$list.FullRowSelect = $true
+$list.GridLines     = $true
+$list.Location      = New-Point 12 12
+$list.Size          = New-Size 540 200
+[void]$list.Columns.Add('Service', 270)
+[void]$list.Columns.Add('Role', 110)
+[void]$list.Columns.Add('Status', 140)
+
+$btnRestart          = New-Object System.Windows.Forms.Button
+$btnRestart.Text     = 'Restart all (primary first)'
+$btnRestart.Location = New-Point 12 222
+$btnRestart.Size     = New-Size 260 36
+
+$btnRefresh          = New-Object System.Windows.Forms.Button
+$btnRefresh.Text     = 'Refresh status'
+$btnRefresh.Location = New-Point 282 222
+$btnRefresh.Size     = New-Size 150 36
+
+$log                 = New-Object System.Windows.Forms.TextBox
+$log.Multiline       = $true
+$log.ReadOnly        = $true
+$log.ScrollBars      = 'Vertical'
+$log.Location        = New-Point 12 270
+$log.Size            = New-Size 540 175
+$log.Font            = New-Object System.Drawing.Font('Consolas', 9)
+
+$form.Controls.AddRange(@($list, $btnRestart, $btnRefresh, $log))
+
+# ---------------- Logic ----------------
+function Write-Log($text) {
+    $log.AppendText(("[{0:HH:mm:ss}] {1}`r`n" -f (Get-Date), $text))
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Update-Status {
+    $list.Items.Clear()
+    $all = @($Primary) + $Others
+    try {
+        $svcs = Invoke-Target {
+            param($names)
+            Get-Service -Name $names -ErrorAction SilentlyContinue |
+                ForEach-Object { [pscustomobject]@{ Name = $_.Name; Status = "$($_.Status)" } }
+        } @(, $all)
+    } catch {
+        Write-Log "Status check failed: $($_.Exception.Message)"
+        return
+    }
+    foreach ($name in $all) {
+        $s      = $svcs | Where-Object { $_.Name -eq $name }
+        $status = if ($s) { $s.Status } else { 'NOT FOUND' }
+        $item   = New-Object System.Windows.Forms.ListViewItem($name)
+        [void]$item.SubItems.Add($(if ($name -eq $Primary) { 'Primary' } else { 'Secondary' }))
+        [void]$item.SubItems.Add($status)
+        $item.UseItemStyleForSubItems = $true
+        $item.ForeColor = if ($status -eq 'Running') { [System.Drawing.Color]::DarkGreen } else { [System.Drawing.Color]::Firebrick }
+        [void]$list.Items.Add($item)
+    }
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Restart-Ordered {
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        "Restart $Primary first, then $($Others.Count) other service(s) on $Computer?",
+        'Confirm restart', 'YesNo', 'Warning')
+    if ($answer -ne 'Yes') { return }
+
+    $btnRestart.Enabled = $false
+    $btnRefresh.Enabled = $false
+    $form.Cursor = 'WaitCursor'
+    try {
+        Write-Log "Restarting $Primary ..."
+        Invoke-Target {
+            param($p, $t)
+            Restart-Service -Name $p -Force -ErrorAction Stop
+            (Get-Service -Name $p).WaitForStatus('Running', [TimeSpan]::FromSeconds($t))
+        } @($Primary, $TimeoutSeconds)
+        Write-Log "$Primary is Running."
+        Update-Status
+
+        foreach ($svc in $Others) {
+            Write-Log "Restarting $svc ..."
+            try {
+                Invoke-Target { param($s) Restart-Service -Name $s -Force -ErrorAction Stop } @($svc)
+                Write-Log "$svc restarted."
+            } catch {
+                Write-Log "ERROR on ${svc}: $($_.Exception.Message)"
+            }
+        }
+        Write-Log 'Done.'
+    } catch {
+        Write-Log "STOPPED: $Primary did not restart cleanly - $($_.Exception.Message)"
+        Write-Log 'Other services were not touched.'
+    } finally {
+        Update-Status
+        $btnRestart.Enabled = $true
+        $btnRefresh.Enabled = $true
+        $form.Cursor = 'Default'
+    }
+}
+
+$btnRestart.Add_Click({ Restart-Ordered })
+$btnRefresh.Add_Click({ Update-Status; Write-Log 'Status refreshed.' })
+$form.Add_Shown({ Update-Status })
+
+[void]$form.ShowDialog()
