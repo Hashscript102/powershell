@@ -1,0 +1,6 @@
+# ---------------- Configure these ----------------
+$Computer       = $env:COMPUTERNAME            # e.g. 'APPSERVER01'
+$Primary        = 'PrimaryServiceName'         # service name (not display name)
+$Others         = @('ServiceA', 'ServiceB', 'ServiceC')
+$TimeoutSeconds = 120                          # how long to wait for the primary to reach Running
+# -------------------------------------------------
