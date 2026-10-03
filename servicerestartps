@@ -1,0 +1,699 @@
+#Requires -Version 5.1
+<#
+    Service Restart Console  (WPF version of ServiceRestartDashboard.ps1)
+
+    - Lists your services with live status pills, start type and PID.
+    - One service is marked PRIMARY. "Restart ticked (primary first)" restarts the primary,
+      waits until it is Running, then restarts everything else that is ticked (order irrelevant).
+      If the primary fails or times out, nothing else is touched.
+    - If the primary is NOT ticked, the ticked services are simply restarted in grid order.
+    - Add / remove services from the UI; the list, primary and computer are saved to
+      ServiceRestartConsole.json next to this script, so you never have to edit the script again.
+    - Watcher: every 5 s it checks the primary (state change, PID change, or Event ID 7036 in the
+      System log). If the primary restarted on its own - crash, recovery action, someone else - a banner
+      appears with a "Restart the others now" button, and optionally the ticked services restart
+      automatically after a settle period.
+    - Works locally or against a remote server (remote needs WinRM / PS remoting).
+    - Self-elevates (UAC prompt) because service control needs admin.
+
+    Launch (shortcut):  powershell.exe -ExecutionPolicy Bypass -File "C:\Tools\ServiceRestartConsole.ps1"
+#>
+
+# ---------------- Defaults (only used the first time, before the .json exists) ----------------
+$DefaultComputer       = $env:COMPUTERNAME           # or 'SERVER01'
+$DefaultPrimary        = 'Spooler'                   # <-- the service that must restart FIRST
+$DefaultOthers         = @('W32Time', 'BITS')        # <-- the rest; order does not matter
+$DefaultTimeoutSeconds = 90
+$WatchIntervalSeconds  = 5      # how often the watcher polls the primary
+$SettleSeconds         = 10     # after an external primary restart, wait this long before auto-restarting the others
+# ----------------------------------------------------------------------------------------------
+
+# --- Self-elevate and make sure we are in an STA thread (WPF needs it) ---
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+$isSta   = [Threading.Thread]::CurrentThread.ApartmentState -eq 'STA'
+if (-not $isAdmin -or -not $isSta) {
+    $exe      = (Get-Process -Id $PID).Path
+    $argLine  = "-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$PSCommandPath`""
+    if (-not $isAdmin) { Start-Process -FilePath $exe -ArgumentList $argLine -Verb RunAs }
+    else               { Start-Process -FilePath $exe -ArgumentList $argLine }
+    exit
+}
+
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml
+
+# --- Row model (WPF binds to real CLR properties, so define a tiny class) ---
+if (-not ('ServiceRow' -as [type])) {
+Add-Type -TypeDefinition @'
+using System.ComponentModel;
+public class ServiceRow : INotifyPropertyChanged {
+    public event PropertyChangedEventHandler PropertyChanged;
+    void N(string p){ var h = PropertyChanged; if (h != null) h(this, new PropertyChangedEventArgs(p)); }
+    bool _sel = true, _pri; string _name = "", _disp = "", _status = "", _start = "", _pid = "";
+    public bool   IsSelected  { get { return _sel;    } set { _sel    = value; N("IsSelected");  } }
+    public bool   IsPrimary   { get { return _pri;    } set { _pri    = value; N("IsPrimary");   } }
+    public string Name        { get { return _name;   } set { _name   = value; N("Name");        } }
+    public string DisplayName { get { return _disp;   } set { _disp   = value; N("DisplayName"); } }
+    public string Status      { get { return _status; } set { _status = value; N("Status");      } }
+    public string StartType   { get { return _start;  } set { _start  = value; N("StartType");   } }
+    public string ProcessId   { get { return _pid;    } set { _pid    = value; N("ProcessId");   } }
+}
+public class ServiceChoice {
+    public string Name { get; set; }
+    public string DisplayName { get; set; }
+    public string State { get; set; }
+    public string Label { get { return Name + "   -   " + DisplayName + "   (" + State + ")"; } }
+}
+'@
+}
+
+# =============================== XAML ===============================
+$StyleXaml = @'
+    <Style x:Key="Btn" TargetType="Button">
+      <Setter Property="Background" Value="#2A3140"/>
+      <Setter Property="Foreground" Value="#E6E8EB"/>
+      <Setter Property="Padding" Value="14,7"/>
+      <Setter Property="Margin" Value="0,0,8,0"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="B" Background="{TemplateBinding Background}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="B" Property="Opacity" Value="0.82"/></Trigger>
+              <Trigger Property="IsPressed"   Value="True"><Setter TargetName="B" Property="Opacity" Value="0.65"/></Trigger>
+              <Trigger Property="IsEnabled"   Value="False"><Setter TargetName="B" Property="Opacity" Value="0.35"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="BtnAccent" TargetType="Button" BasedOn="{StaticResource Btn}"><Setter Property="Background" Value="#2563EB"/></Style>
+    <Style x:Key="BtnGood"   TargetType="Button" BasedOn="{StaticResource Btn}"><Setter Property="Background" Value="#15803D"/></Style>
+    <Style x:Key="BtnDanger" TargetType="Button" BasedOn="{StaticResource Btn}"><Setter Property="Background" Value="#B91C1C"/></Style>
+    <Style x:Key="BtnFlat"   TargetType="Button" BasedOn="{StaticResource Btn}">
+      <Setter Property="Background" Value="Transparent"/><Setter Property="Foreground" Value="#9AA3B2"/><Setter Property="FontWeight" Value="Normal"/>
+    </Style>
+    <Style x:Key="Txt" TargetType="TextBox">
+      <Setter Property="Background" Value="#0F1218"/>
+      <Setter Property="Foreground" Value="#E6E8EB"/>
+      <Setter Property="CaretBrush" Value="#E6E8EB"/>
+      <Setter Property="BorderBrush" Value="#3A4252"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="8,5"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+    </Style>
+    <Style TargetType="ListBox">
+      <Setter Property="Background" Value="#0F1218"/>
+      <Setter Property="Foreground" Value="#E6E8EB"/>
+      <Setter Property="BorderBrush" Value="#3A4252"/>
+    </Style>
+    <Style TargetType="DataGridColumnHeader">
+      <Setter Property="Background" Value="#232834"/>
+      <Setter Property="Foreground" Value="#9AA3B2"/>
+      <Setter Property="FontSize" Value="11"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Padding" Value="8,8"/>
+      <Setter Property="BorderBrush" Value="#3A4252"/>
+      <Setter Property="BorderThickness" Value="0,0,0,1"/>
+    </Style>
+    <Style TargetType="DataGridRow">
+      <Setter Property="Background" Value="Transparent"/>
+      <Style.Triggers>
+        <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#2A3140"/></Trigger>
+        <Trigger Property="IsSelected"  Value="True"><Setter Property="Background" Value="#2F3B52"/></Trigger>
+      </Style.Triggers>
+    </Style>
+    <Style TargetType="DataGridCell">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Foreground" Value="#E6E8EB"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Padding" Value="8,0"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="DataGridCell">
+            <Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
+              <ContentPresenter VerticalAlignment="Center"/>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+'@
+
+$MainXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Service Restart Console" Width="1020" Height="700" MinWidth="880" MinHeight="580"
+        WindowStartupLocation="CenterScreen" Background="#1B1F27" Foreground="#E6E8EB"
+        FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True" TextOptions.TextFormattingMode="Display">
+  <Window.Resources>
+<!--STYLES-->
+  </Window.Resources>
+  <Grid Margin="18">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="190"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <!-- Header -->
+    <Grid Grid.Row="0" Margin="0,0,0,14">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+      <StackPanel>
+        <TextBlock Text="Service Restart Console" FontSize="22" FontWeight="SemiBold"/>
+        <TextBlock Text="Restarts the primary service first and waits for it, then the rest." Foreground="#9AA3B2" Margin="0,2,0,0"/>
+      </StackPanel>
+      <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+        <TextBlock Text="Computer" Foreground="#9AA3B2" VerticalAlignment="Center" Margin="0,0,8,0"/>
+        <TextBox Name="ComputerBox" Width="190" Style="{StaticResource Txt}"/>
+        <TextBlock Text="Timeout (s)" Foreground="#9AA3B2" VerticalAlignment="Center" Margin="14,0,8,0"/>
+        <TextBox Name="TimeoutBox" Width="56" Style="{StaticResource Txt}"/>
+        <Button Name="BtnConnect" Content="Connect" Style="{StaticResource Btn}" Margin="14,0,0,0"/>
+      </StackPanel>
+    </Grid>
+
+    <!-- Toolbar -->
+    <Grid Grid.Row="1" Margin="0,0,0,10">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+      <StackPanel Orientation="Horizontal">
+        <Button Name="BtnAdd"     Content="+ Add service"   Style="{StaticResource Btn}"/>
+        <Button Name="BtnRemove"  Content="Remove"          Style="{StaticResource Btn}"/>
+        <Button Name="BtnPrimary" Content="Set as primary"  Style="{StaticResource Btn}"/>
+        <Rectangle Width="1" Fill="#3A4252" Margin="4,4,12,4"/>
+        <Button Name="BtnAll"  Content="Tick all"   Style="{StaticResource BtnFlat}"/>
+        <Button Name="BtnNone" Content="Untick all" Style="{StaticResource BtnFlat}"/>
+      </StackPanel>
+      <StackPanel Grid.Column="1" Orientation="Horizontal">
+        <Button Name="BtnRefresh"    Content="Refresh" Style="{StaticResource Btn}"/>
+        <Button Name="BtnStart"      Content="Start"   Style="{StaticResource BtnGood}"/>
+        <Button Name="BtnStop"       Content="Stop"    Style="{StaticResource BtnDanger}"/>
+        <Button Name="BtnRestartOne" Content="Restart" Style="{StaticResource Btn}"/>
+        <Button Name="BtnRestartAll" Content="Restart ticked (primary first)" Style="{StaticResource BtnAccent}" Margin="8,0,0,0"/>
+      </StackPanel>
+    </Grid>
+
+    <!-- Watcher banner (shown when the primary restarted outside this console) -->
+    <Border Grid.Row="2" Name="Banner" Visibility="Collapsed" Background="#3B2A0F" BorderBrush="#B45309" BorderThickness="1"
+            CornerRadius="8" Padding="12,8" Margin="0,0,0,10">
+      <Grid>
+        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+        <TextBlock Name="BannerText" Foreground="#FBBF24" FontWeight="SemiBold" VerticalAlignment="Center" TextWrapping="Wrap" Margin="0,0,12,0"/>
+        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+          <Button Name="BtnBannerRestart" Content="Restart the others now" Style="{StaticResource BtnAccent}"/>
+          <Button Name="BtnBannerDismiss" Content="Dismiss" Style="{StaticResource BtnFlat}" Margin="0"/>
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <!-- Service grid -->
+    <Border Grid.Row="3" Background="#232834" CornerRadius="8" Padding="4">
+      <DataGrid Name="ServiceGrid" AutoGenerateColumns="False" CanUserAddRows="False" CanUserDeleteRows="False"
+                CanUserResizeRows="False" CanUserReorderColumns="False" HeadersVisibility="Column" GridLinesVisibility="None"
+                SelectionMode="Single" SelectionUnit="FullRow" IsReadOnly="True" RowHeight="38"
+                Background="Transparent" BorderThickness="0" RowBackground="Transparent" Foreground="#E6E8EB">
+        <DataGrid.Columns>
+          <DataGridTemplateColumn Header="Restart" Width="68" CanUserResize="False">
+            <DataGridTemplateColumn.CellTemplate><DataTemplate>
+              <CheckBox IsChecked="{Binding IsSelected, UpdateSourceTrigger=PropertyChanged}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </DataTemplate></DataGridTemplateColumn.CellTemplate>
+          </DataGridTemplateColumn>
+          <DataGridTemplateColumn Header="Primary" Width="68" CanUserResize="False">
+            <DataGridTemplateColumn.CellTemplate><DataTemplate>
+              <RadioButton GroupName="PrimaryGroup" IsChecked="{Binding IsPrimary, UpdateSourceTrigger=PropertyChanged}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </DataTemplate></DataGridTemplateColumn.CellTemplate>
+          </DataGridTemplateColumn>
+          <DataGridTextColumn Header="Service" Binding="{Binding Name}" Width="180" FontWeight="SemiBold"/>
+          <DataGridTextColumn Header="Display name" Binding="{Binding DisplayName}" Width="*"/>
+          <DataGridTemplateColumn Header="Status" Width="120">
+            <DataGridTemplateColumn.CellTemplate>
+              <DataTemplate>
+                <Border x:Name="Pill" CornerRadius="10" Padding="9,2" HorizontalAlignment="Left" Background="#B45309">
+                  <TextBlock Text="{Binding Status}" FontSize="11" FontWeight="SemiBold" Foreground="White"/>
+                </Border>
+                <DataTemplate.Triggers>
+                  <DataTrigger Binding="{Binding Status}" Value="Running">  <Setter TargetName="Pill" Property="Background" Value="#15803D"/></DataTrigger>
+                  <DataTrigger Binding="{Binding Status}" Value="Stopped">  <Setter TargetName="Pill" Property="Background" Value="#B91C1C"/></DataTrigger>
+                  <DataTrigger Binding="{Binding Status}" Value="Not found"><Setter TargetName="Pill" Property="Background" Value="#4B5563"/></DataTrigger>
+                  <DataTrigger Binding="{Binding Status}" Value="">         <Setter TargetName="Pill" Property="Visibility" Value="Collapsed"/></DataTrigger>
+                </DataTemplate.Triggers>
+              </DataTemplate>
+            </DataGridTemplateColumn.CellTemplate>
+          </DataGridTemplateColumn>
+          <DataGridTextColumn Header="Start type" Binding="{Binding StartType}" Width="90"/>
+          <DataGridTextColumn Header="PID" Binding="{Binding ProcessId}" Width="70"/>
+        </DataGrid.Columns>
+      </DataGrid>
+    </Border>
+
+    <!-- Log -->
+    <Border Grid.Row="4" Background="#11141A" CornerRadius="8" Margin="0,12,0,0" Padding="8">
+      <ListBox Name="LogList" Background="Transparent" BorderThickness="0" FontFamily="Consolas" FontSize="12"
+               ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+        <ListBox.ItemContainerStyle>
+          <Style TargetType="ListBoxItem">
+            <Setter Property="Focusable" Value="False"/>
+            <Setter Property="Template">
+              <Setter.Value><ControlTemplate TargetType="ListBoxItem"><ContentPresenter Margin="4,1"/></ControlTemplate></Setter.Value>
+            </Setter>
+          </Style>
+        </ListBox.ItemContainerStyle>
+      </ListBox>
+    </Border>
+
+    <!-- Status bar -->
+    <Grid Grid.Row="5" Margin="0,10,0,0">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+      <StackPanel VerticalAlignment="Center">
+        <ProgressBar Name="BusyBar" Height="3" IsIndeterminate="True" Visibility="Collapsed" Foreground="#2563EB" Background="Transparent" BorderThickness="0" Margin="0,0,0,6"/>
+        <TextBlock Name="StatusText" Text="Starting..." Foreground="#9AA3B2" FontSize="12"/>
+      </StackPanel>
+      <CheckBox Grid.Column="1" Name="AutoChain" Content="Auto-restart ticked services when the primary restarts on its own"
+                Foreground="#C4CAD4" FontSize="12" VerticalAlignment="Center" Margin="0,0,16,0"/>
+      <Button Grid.Column="2" Name="BtnClearLog" Content="Clear log" Style="{StaticResource BtnFlat}" Margin="0"/>
+    </Grid>
+  </Grid>
+</Window>
+'@
+
+$DialogXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Add services" Width="620" Height="540" WindowStartupLocation="CenterOwner"
+        Background="#1B1F27" Foreground="#E6E8EB" FontFamily="Segoe UI" FontSize="13" ResizeMode="CanResize">
+  <Window.Resources>
+<!--STYLES-->
+  </Window.Resources>
+  <Grid Margin="16">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <TextBox Name="DlgFilter" Style="{StaticResource Txt}" Margin="0,0,0,10" FontSize="14"/>
+    <ListBox Name="DlgList" Grid.Row="1" SelectionMode="Extended" DisplayMemberPath="Label" FontFamily="Consolas" FontSize="12"/>
+    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+      <TextBlock Text="Type to filter. Ctrl/Shift-click to pick several." Foreground="#9AA3B2" VerticalAlignment="Center" Margin="0,0,16,0"/>
+      <Button Name="DlgOk"     Content="Add selected" Style="{StaticResource BtnAccent}"/>
+      <Button Name="DlgCancel" Content="Cancel"       Style="{StaticResource Btn}" Margin="0"/>
+    </StackPanel>
+  </Grid>
+</Window>
+'@
+
+function New-WpfWindow([string]$Xaml) {
+    [xml]$doc = $Xaml.Replace('<!--STYLES-->', $StyleXaml)
+    $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $doc))
+    $map = @{}
+    foreach ($n in $doc.SelectNodes('//*[@Name]')) { $map[$n.Name] = $win.FindName($n.Name) }
+    return $win, $map
+}
+
+# =============================== Helpers ===============================
+$ConfigPath   = Join-Path (Split-Path -Parent $PSCommandPath) 'ServiceRestartConsole.json'
+$script:Busy  = $false
+$script:Guard = $false
+$script:Rows  = New-Object 'System.Collections.ObjectModel.ObservableCollection[ServiceRow]'
+$script:LastPrimary    = $null              # last seen Name / Pid / State of the primary (watcher baseline)
+$script:LastEventCheck = Get-Date           # high-water mark for the System-log 7036 query
+$script:IgnoreUntil    = Get-Date           # suppress watcher briefly after we handled a restart ourselves
+
+function Invoke-DoEvents {
+    $frame = New-Object System.Windows.Threading.DispatcherFrame
+    $cb = [System.Windows.Threading.DispatcherOperationCallback]{ param($f) $f.Continue = $false; return $null }
+    [void][System.Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, $cb, $frame)
+    [System.Windows.Threading.Dispatcher]::PushFrame($frame)
+}
+
+function Test-IsLocal {
+    $c = $script:Computer
+    return [string]::IsNullOrWhiteSpace($c) -or ($c -in @('.', 'localhost', $env:COMPUTERNAME)) -or
+           ($env:USERDNSDOMAIN -and $c -eq "$env:COMPUTERNAME.$env:USERDNSDOMAIN")
+}
+function Get-CimArgs { if (Test-IsLocal) { @{} } else { @{ ComputerName = $script:Computer } } }
+function Invoke-Target([scriptblock]$Script, [object[]]$Arguments) {
+    if (Test-IsLocal) { & $Script @Arguments }
+    else { Invoke-Command -ComputerName $script:Computer -ScriptBlock $Script -ArgumentList $Arguments -ErrorAction Stop }
+}
+
+function Add-Log([string]$Message, [string]$Kind = 'info') {
+    $color = switch ($Kind) { 'ok' {'#4ADE80'} 'warn' {'#FBBF24'} 'err' {'#F87171'} 'head' {'#93C5FD'} default {'#C4CAD4'} }
+    $tb = New-Object System.Windows.Controls.TextBlock
+    $tb.Text = "[{0:HH:mm:ss}] {1}" -f (Get-Date), $Message
+    $tb.TextWrapping = 'Wrap'
+    $tb.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString($color)
+    if ($Kind -eq 'head') { $tb.FontWeight = 'Bold' }
+    [void]$LogList.Items.Add($tb)
+    $LogList.ScrollIntoView($tb)
+    Invoke-DoEvents
+}
+
+function Get-Timeout {
+    $t = 0
+    if ([int]::TryParse($TimeoutBox.Text, [ref]$t) -and $t -gt 0) { return $t }
+    $TimeoutBox.Text = "$DefaultTimeoutSeconds"
+    return $DefaultTimeoutSeconds
+}
+
+function Set-RowFromCim($Row, $Svc) {
+    $Row.DisplayName = [string]$Svc.DisplayName
+    $Row.Status      = [string]$Svc.State
+    $Row.StartType   = [string]$Svc.StartMode
+    $Row.ProcessId   = if ($Svc.ProcessId) { [string]$Svc.ProcessId } else { '' }
+}
+
+function Get-OneService([string]$Name) {
+    $ca = Get-CimArgs
+    Get-CimInstance -ClassName Win32_Service -Filter "Name='$($Name.Replace("'", "''"))'" @ca -ErrorAction Stop | Select-Object -First 1
+}
+
+function Update-Status {
+    if ($script:Rows.Count -eq 0) { $StatusText.Text = "Connected to $($script:Computer) - no services configured. Click '+ Add service'."; return }
+    try {
+        $ca    = Get-CimArgs
+        $names = @($script:Rows | ForEach-Object Name)
+        $cim   = @(Get-CimInstance -ClassName Win32_Service @ca -ErrorAction Stop | Where-Object { $names -contains $_.Name })
+        foreach ($row in $script:Rows) {
+            $svc = $cim | Where-Object { $_.Name -eq $row.Name } | Select-Object -First 1
+            if ($svc) { Set-RowFromCim $row $svc }
+            else { $row.Status = 'Not found'; $row.StartType = ''; $row.ProcessId = '' }
+        }
+        $p = $script:Rows | Where-Object IsPrimary | Select-Object -First 1
+        $watch = if ($p) { "   |   watching $($p.Name)" + $(if ($p.ProcessId) { " (PID $($p.ProcessId))" }) } else { '' }
+        $StatusText.Text = "Connected to $($script:Computer)   |   updated {0:HH:mm:ss}$watch" -f (Get-Date)
+        Test-PrimaryRestart
+    } catch {
+        $StatusText.Text = "Cannot reach $($script:Computer)"
+        Add-Log "Status check failed: $($_.Exception.Message)" 'err'
+    }
+}
+
+# ---- Watcher: did the primary restart without us? ----
+function Test-RestartEvent($Row) {
+    # Event 7036 "The <display name> service entered the running state." is written by the SCM on every start.
+    $since = $script:LastEventCheck
+    $script:LastEventCheck = Get-Date
+    try {
+        $args = @{ FilterHashtable = @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = 7036; StartTime = $since }; ErrorAction = 'SilentlyContinue' }
+        if (-not (Test-IsLocal)) { $args.ComputerName = $script:Computer }
+        $dn = if ($Row.DisplayName) { $Row.DisplayName } else { $Row.Name }
+        $hit = Get-WinEvent @args | Where-Object { $_.Message -like "*$dn*" -and $_.Message -like '*running*' } | Select-Object -First 1
+        return [bool]$hit
+    } catch { return $false }
+}
+
+function Test-PrimaryRestart {
+    $p = $script:Rows | Where-Object IsPrimary | Select-Object -First 1
+    if (-not $p) { $script:LastPrimary = $null; return }
+    $prev = $script:LastPrimary
+    $now  = @{ Name = $p.Name; Pid = $p.ProcessId; State = $p.Status }
+    $script:LastPrimary = $now
+    if (-not $prev -or $prev.Name -ne $now.Name) { return }                 # first sighting, or primary was changed
+    if ($script:Busy -or (Get-Date) -lt $script:IgnoreUntil) { return }    # we are the ones restarting it
+    if ($now.State -ne 'Running') { return }
+
+    $reason = $null
+    if     ($prev.State -ne 'Running')                             { $reason = "went $($prev.State) -> Running" }
+    elseif ($prev.Pid -and $now.Pid -and $prev.Pid -ne $now.Pid)   { $reason = "PID changed $($prev.Pid) -> $($now.Pid)" }
+    elseif (Test-RestartEvent $p)                                  { $reason = 'Event ID 7036 (entered the running state)' }
+    if ($reason) { Invoke-PrimaryRestarted $p $reason }
+}
+
+function Invoke-PrimaryRestarted($Row, [string]$Reason) {
+    $script:IgnoreUntil = (Get-Date).AddSeconds(15)
+    $when = Get-Date -Format 'HH:mm:ss'
+    Add-Log "WATCHER: $($Row.Name) was restarted outside this console at $when ($Reason)." 'warn'
+    $BannerText.Text = "$($Row.Name) restarted on its own at $when ($Reason). The other services may need a restart."
+    $Banner.Visibility = 'Visible'
+    if ($AutoChain.IsChecked) {
+        Set-Busy $true
+        try {
+            Add-Log "Auto-restart is on. Waiting $SettleSeconds s for $($Row.Name) to settle ..." 'head'
+            $until = (Get-Date).AddSeconds($SettleSeconds)
+            while ((Get-Date) -lt $until) { Start-Sleep -Milliseconds 500; Invoke-DoEvents }
+            try { $svc = Get-OneService $Row.Name; if ($svc) { Set-RowFromCim $Row $svc } } catch { }
+            if ($Row.Status -ne 'Running') { Add-Log "$($Row.Name) is $($Row.Status) again - not restarting the others." 'err'; return }
+            Invoke-SecondaryChain @($script:Rows | Where-Object { $_.IsSelected -and -not $_.IsPrimary }) (Get-Timeout)
+            $Banner.Visibility = 'Collapsed'
+        } finally { Update-Status; Set-Busy $false }
+    }
+}
+
+function Wait-ForState($Row, [string]$State, [int]$Timeout) {
+    $deadline = (Get-Date).AddSeconds($Timeout)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 600
+        Invoke-DoEvents
+        try { $svc = Get-OneService $Row.Name; if ($svc) { Set-RowFromCim $Row $svc } } catch { }
+        if ($Row.Status -eq $State) { return $true }
+    }
+    return $false
+}
+
+function Stop-Row($Row, [int]$Timeout) {
+    if ($Row.Status -eq 'Stopped') { Add-Log "$($Row.Name) is already stopped." ; return }
+    Add-Log "Stopping $($Row.Name) ..."
+    Invoke-Target { param($n) Stop-Service -Name $n -Force -NoWait -ErrorAction Stop } @($Row.Name)
+    if (-not (Wait-ForState $Row 'Stopped' $Timeout)) { throw "$($Row.Name) did not stop within $Timeout s (state: $($Row.Status))" }
+}
+function Start-Row($Row, [int]$Timeout) {
+    Add-Log "Starting $($Row.Name) ..."
+    Invoke-Target { param($n) (Get-Service -Name $n -ErrorAction Stop).Start() } @($Row.Name)
+    if (-not (Wait-ForState $Row 'Running' $Timeout)) { throw "$($Row.Name) did not reach Running within $Timeout s (state: $($Row.Status))" }
+}
+function Restart-Row($Row, [int]$Timeout) {
+    Stop-Row  $Row $Timeout
+    Start-Row $Row $Timeout
+}
+
+function Set-Busy([bool]$On) {
+    $script:Busy = $On
+    foreach ($b in @($BtnRestartAll, $BtnRestartOne, $BtnStart, $BtnStop, $BtnRefresh, $BtnAdd, $BtnRemove, $BtnPrimary, $BtnConnect, $BtnBannerRestart)) { $b.IsEnabled = -not $On }
+    $BusyBar.Visibility = if ($On) { 'Visible' } else { 'Collapsed' }
+    $Window.Cursor = if ($On) { [System.Windows.Input.Cursors]::AppStarting } else { $null }
+    Invoke-DoEvents
+}
+
+function Confirm([string]$Text) {
+    return ([System.Windows.MessageBox]::Show($Window, $Text, 'Confirm', 'YesNo', 'Warning') -eq 'Yes')
+}
+
+function Register-Row($Row) {
+    # keep exactly one primary
+    $Row.add_PropertyChanged({ param($s, $e)
+        if ($e.PropertyName -eq 'IsPrimary' -and $s.IsPrimary -and -not $script:Guard) {
+            $script:Guard = $true
+            foreach ($r in $script:Rows) { if (-not [object]::ReferenceEquals($r, $s) -and $r.IsPrimary) { $r.IsPrimary = $false } }
+            $script:Guard = $false
+        }
+    })
+}
+
+function Add-Row([string]$Name, [bool]$Primary) {
+    if ($script:Rows | Where-Object { $_.Name -eq $Name }) { return }
+    $r = New-Object ServiceRow
+    $r.Name = $Name; $r.IsSelected = $true; $r.IsPrimary = $Primary
+    Register-Row $r
+    if ($Primary) { $script:Rows.Insert(0, $r) } else { $script:Rows.Add($r) }
+}
+
+function Save-Config {
+    $p = $script:Rows | Where-Object IsPrimary | Select-Object -First 1
+    [pscustomobject]@{
+        Computer       = $script:Computer
+        Primary        = if ($p) { $p.Name } else { $null }
+        Others         = @($script:Rows | Where-Object { -not $_.IsPrimary } | ForEach-Object Name)
+        TimeoutSeconds = Get-Timeout
+        AutoChain      = [bool]$AutoChain.IsChecked
+    } | ConvertTo-Json | Set-Content -Path $ConfigPath -Encoding UTF8
+}
+
+function Load-Config {
+    $computer = $DefaultComputer; $primary = $DefaultPrimary; $others = @($DefaultOthers); $timeout = $DefaultTimeoutSeconds
+    if (Test-Path $ConfigPath) {
+        try {
+            $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+            if ($cfg.Computer)       { $computer = $cfg.Computer }
+            if ($cfg.PSObject.Properties['Primary']) { $primary = $cfg.Primary }
+            if ($cfg.PSObject.Properties['Others'])  { $others  = @($cfg.Others) }
+            if ($cfg.TimeoutSeconds) { $timeout = [int]$cfg.TimeoutSeconds }
+            if ($cfg.PSObject.Properties['AutoChain']) { $AutoChain.IsChecked = [bool]$cfg.AutoChain }
+        } catch { }
+    }
+    $script:LastPrimary = $null
+    $script:Computer  = $computer
+    $ComputerBox.Text = $computer
+    $TimeoutBox.Text  = "$timeout"
+    $script:Rows.Clear()
+    if ($primary) { Add-Row $primary $true }
+    foreach ($o in $others) { if ($o) { Add-Row $o $false } }
+}
+
+# =============================== Actions ===============================
+function Start-RestartChain {
+    $ticked = @($script:Rows | Where-Object IsSelected)
+    if ($ticked.Count -eq 0) { [void][System.Windows.MessageBox]::Show($Window, 'Tick at least one service in the Restart column.', 'Nothing to do', 'OK', 'Information'); return }
+    $primary = $ticked | Where-Object IsPrimary | Select-Object -First 1
+    $others  = @($ticked | Where-Object { -not $_.IsPrimary })
+    $timeout = Get-Timeout
+
+    $msg = if ($primary) { "Restart $($primary.Name) FIRST (and wait for it), then $($others.Count) other service(s) on $($script:Computer)?" }
+           else          { "Restart $($ticked.Count) service(s) on $($script:Computer)?`n`nThe primary service is not ticked, so order does not matter." }
+    if (-not (Confirm $msg)) { return }
+
+    Set-Busy $true
+    try {
+        if ($primary) {
+            Add-Log "Step 1 - primary: $($primary.Name)" 'head'
+            try { Restart-Row $primary $timeout }
+            catch {
+                Add-Log "STOPPED: $($_.Exception.Message)" 'err'
+                Add-Log 'The other services were not touched.' 'warn'
+                return
+            }
+            Add-Log "$($primary.Name) is Running." 'ok'
+        }
+        Invoke-SecondaryChain $others $timeout
+        $Banner.Visibility = 'Collapsed'
+    } finally {
+        Update-Status      # refresh (and re-baseline the watcher) BEFORE clearing Busy
+        Set-Busy $false
+    }
+}
+
+# Restarts the non-primary services (order does not matter) and prints a summary. Caller handles Set-Busy.
+function Invoke-SecondaryChain([object[]]$Others, [int]$Timeout) {
+    $failed = 0
+    if ($Others.Count -gt 0) { Add-Log "Restarting the other services ($($Others.Count))" 'head' }
+    foreach ($row in $Others) {
+        try { Restart-Row $row $Timeout; Add-Log "$($row.Name) is Running." 'ok' }
+        catch { $failed++; Add-Log "ERROR $($row.Name): $($_.Exception.Message)" 'err' }
+    }
+    Update-Status
+    $notRunning = @($script:Rows | Where-Object { $_.Status -ne 'Running' } | ForEach-Object Name)
+    if ($failed -eq 0 -and $notRunning.Count -eq 0) { Add-Log 'Done - all services are Running.' 'ok' }
+    else { Add-Log "Finished with $failed error(s). Not running: $($notRunning -join ', ')" 'warn' }
+}
+
+function Start-SecondaryOnly {
+    $others = @($script:Rows | Where-Object { $_.IsSelected -and -not $_.IsPrimary })
+    if ($others.Count -eq 0) { [void][System.Windows.MessageBox]::Show($Window, 'No non-primary services are ticked.', 'Nothing to do', 'OK', 'Information'); return }
+    if (-not (Confirm "Restart $($others.Count) ticked service(s) on $($script:Computer)? (The primary will not be touched.)")) { return }
+    Set-Busy $true
+    try { Invoke-SecondaryChain $others (Get-Timeout); $Banner.Visibility = 'Collapsed' }
+    finally { Update-Status; Set-Busy $false }
+}
+
+function Invoke-OnSelected([string]$Action) {
+    $row = $ServiceGrid.SelectedItem
+    if (-not $row) { [void][System.Windows.MessageBox]::Show($Window, 'Click a row first.', 'No service selected', 'OK', 'Information'); return }
+    if ($Action -ne 'Start' -and -not (Confirm "$Action $($row.Name) on $($script:Computer)?")) { return }
+    Set-Busy $true
+    try {
+        $t = Get-Timeout
+        switch ($Action) {
+            'Start'   { if ($row.Status -eq 'Running') { Add-Log "$($row.Name) is already running." } else { Start-Row $row $t; Add-Log "$($row.Name) is Running." 'ok' } }
+            'Stop'    { Stop-Row $row $t;    Add-Log "$($row.Name) stopped." 'ok' }
+            'Restart' { Restart-Row $row $t; Add-Log "$($row.Name) is Running." 'ok' }
+        }
+    } catch { Add-Log "ERROR $($row.Name): $($_.Exception.Message)" 'err' }
+    finally { Update-Status; Set-Busy $false }
+}
+
+function Show-AddDialog {
+    try {
+        $ca  = Get-CimArgs
+        $all = @(Get-CimInstance -ClassName Win32_Service @ca -ErrorAction Stop | Sort-Object DisplayName)
+    } catch { Add-Log "Could not list services on $($script:Computer): $($_.Exception.Message)" 'err'; return }
+
+    $existing = @($script:Rows | ForEach-Object Name)
+    $choices  = @(foreach ($s in $all) {
+        if ($existing -notcontains $s.Name) {
+            $c = New-Object ServiceChoice; $c.Name = $s.Name; $c.DisplayName = $s.DisplayName; $c.State = $s.State; $c
+        }
+    })
+
+    $dlg, $d = New-WpfWindow $DialogXaml
+    $dlg.Owner = $Window
+    $d.DlgList.ItemsSource = $choices
+    $d.DlgFilter.Add_TextChanged({
+        $t = $d.DlgFilter.Text
+        $d.DlgList.ItemsSource = @($choices | Where-Object { -not $t -or $_.Name -like "*$t*" -or $_.DisplayName -like "*$t*" })
+    }.GetNewClosure())
+    $d.DlgList.Add_MouseDoubleClick({ $dlg.DialogResult = $true }.GetNewClosure())
+    $d.DlgOk.Add_Click({ $dlg.DialogResult = $true }.GetNewClosure())
+    $d.DlgCancel.Add_Click({ $dlg.DialogResult = $false }.GetNewClosure())
+    $dlg.Add_ContentRendered({ $d.DlgFilter.Focus() }.GetNewClosure())
+
+    if ($dlg.ShowDialog() -eq $true) {
+        $picked = @($d.DlgList.SelectedItems)
+        $makePrimary = -not ($script:Rows | Where-Object IsPrimary)
+        foreach ($p in $picked) { Add-Row $p.Name $makePrimary; $makePrimary = $false }
+        if ($picked.Count) { Add-Log "Added: $(($picked | ForEach-Object Name) -join ', ')"; Update-Status; Save-Config }
+    }
+}
+
+# =============================== Build window ===============================
+$Window, $ui = New-WpfWindow $MainXaml
+foreach ($k in $ui.Keys) { Set-Variable -Name $k -Value $ui[$k] -Scope Script }
+
+$ServiceGrid.ItemsSource = $script:Rows
+
+$BtnConnect.Add_Click({
+    $script:Computer = $ComputerBox.Text.Trim()
+    if (-not $script:Computer) { $script:Computer = $env:COMPUTERNAME; $ComputerBox.Text = $script:Computer }
+    Add-Log "Connecting to $($script:Computer) ..."
+    Update-Status; Save-Config
+})
+$ComputerBox.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Return') { $BtnConnect.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent))) } })
+
+$BtnRefresh.Add_Click({ Update-Status; Add-Log 'Status refreshed.' })
+$BtnRestartAll.Add_Click({ Start-RestartChain })
+$BtnRestartOne.Add_Click({ Invoke-OnSelected 'Restart' })
+$BtnStart.Add_Click({ Invoke-OnSelected 'Start' })
+$BtnStop.Add_Click({ Invoke-OnSelected 'Stop' })
+$BtnAdd.Add_Click({ Show-AddDialog })
+$BtnRemove.Add_Click({
+    $row = $ServiceGrid.SelectedItem
+    if ($row) { [void]$script:Rows.Remove($row); Add-Log "Removed $($row.Name) from the list."; Save-Config }
+})
+$BtnPrimary.Add_Click({
+    $row = $ServiceGrid.SelectedItem
+    if ($row) {
+        $row.IsPrimary = $true
+        [void]$script:Rows.Remove($row); $script:Rows.Insert(0, $row); $ServiceGrid.SelectedItem = $row
+        Add-Log "$($row.Name) is now the primary service." 'head'; Save-Config
+    }
+})
+$BtnAll.Add_Click({  foreach ($r in $script:Rows) { $r.IsSelected = $true } })
+$BtnNone.Add_Click({ foreach ($r in $script:Rows) { $r.IsSelected = $false } })
+$BtnClearLog.Add_Click({ $LogList.Items.Clear() })
+$BtnBannerRestart.Add_Click({ Start-SecondaryOnly })
+$BtnBannerDismiss.Add_Click({ $Banner.Visibility = 'Collapsed' })
+$AutoChain.Add_Click({
+    Save-Config
+    if ($AutoChain.IsChecked) { Add-Log "Auto-restart ON: when the primary restarts on its own, the ticked services restart after $SettleSeconds s." 'head' }
+    else                      { Add-Log 'Auto-restart OFF: the watcher will only show a banner.' }
+})
+
+# watcher / auto-refresh: poll the services while idle
+$Timer = New-Object System.Windows.Threading.DispatcherTimer
+$Timer.Interval = [TimeSpan]::FromSeconds($WatchIntervalSeconds)
+$Timer.Add_Tick({ if (-not $script:Busy) { Update-Status } })
+
+$Window.Add_ContentRendered({
+    Load-Config
+    Add-Log "Service Restart Console ready. Config: $ConfigPath"
+    Update-Status
+    $p = $script:Rows | Where-Object IsPrimary | Select-Object -First 1
+    if ($p) { Add-Log "Watcher armed: checking $($p.Name) every $WatchIntervalSeconds s for an external restart." }
+    $Timer.Start()
+})
+$Window.Add_Closing({ $Timer.Stop(); try { Save-Config } catch { } })
+
+[void]$Window.ShowDialog()
