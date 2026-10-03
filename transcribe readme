@@ -1,0 +1,24 @@
+transcribe_videos.py transcribes recordings on your own PC using Whisper, an open-source speech-recognition model.
+
+Setup and run
+
+pip install faster-whisper
+python transcribe_videos.py "C:\Users\Gagan\Videos\Screen Recordings"
+
+What you get for each recording
+
+A .txt transcript with [hh:mm:ss] timestamps. This is the file to give me.
+A .srt subtitle file, so you can play the video with captions.
+ALL_TRANSCRIPTS.md, which combines every transcript when you run it on a folder, so I can analyze the whole series in one go.
+
+Options worth knowing
+
+--frames 30 saves a screenshot every 30 seconds. Training sessions are often "click here, then this screen," and the transcript alone misses that. You can attach a few screenshots alongside the transcript.
+--model medium is more accurate for jargon-heavy content. small, the default, is quicker on a laptop CPU.
+--skip-existing lets you re-run the same folder as you record more sessions, and it only processes the new ones.
+
+Notes
+
+The first run downloads the model once. After that it runs fully offline.
+I tested the script's logic but couldn't do a real transcription here, because the model download is blocked in my sandbox.
+No install option: if the recordings are on your work OneDrive, uploading them to Microsoft Stream generates a transcript automatically and keeps them inside the tenant.
