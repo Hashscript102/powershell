@@ -1,0 +1,138 @@
+"""
+transcribe_videos.py -- turn screen recordings (Snipping Tool .mp4, Teams, etc.)
+into timestamped transcripts, fully offline, using faster-whisper.
+
+Optionally grabs screenshots every N seconds so the visual parts of a demo
+(what was clicked/shown) can be reviewed alongside the transcript.
+
+Install
+  pip install faster-whisper
+  # optional, for --frames:  pip install av pillow   (av is already installed by faster-whisper)
+
+Use
+  python transcribe_videos.py "C:\\Users\\Gagan\\Videos\\Screen Recordings"
+  python transcribe_videos.py training1.mp4 --model medium
+  python transcribe_videos.py "C:\\Recordings" --frames 30       # screenshot every 30 s
+
+Outputs (next to each video, or in --out):
+  <name>.txt   transcript with [hh:mm:ss] timestamps   <- give this to Claude
+  <name>.srt   subtitles (play alongside the video in VLC / Media Player)
+  <name>_frames\\  screenshots named by timestamp       (with --frames)
+  ALL_TRANSCRIPTS.md   every transcript combined, for one-shot analysis
+
+Models: tiny / base / small (default, fast on CPU) / medium / large-v3 (most accurate).
+First run downloads the model once; after that everything runs offline.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+VIDEO_EXT = {".mp4", ".mkv", ".mov", ".avi", ".wmv", ".webm", ".m4a", ".mp3", ".wav"}
+
+
+def ts(sec: float, srt=False) -> str:
+    h, rem = divmod(int(sec), 3600)
+    m, s = divmod(rem, 60)
+    if srt:
+        ms = int((sec - int(sec)) * 1000)
+        return f"{h:02}:{m:02}:{s:02},{ms:03}"
+    return f"{h:02}:{m:02}:{s:02}"
+
+
+def transcribe(model, path: Path, outdir: Path, language: str | None):
+    t0 = time.time()
+    segments, info = model.transcribe(str(path), language=language, vad_filter=True,
+                                      beam_size=5, condition_on_previous_text=True)
+    print(f"  language: {info.language} ({info.language_probability:.0%}), "
+          f"duration {ts(info.duration)}")
+
+    lines, srt = [], []
+    for i, seg in enumerate(segments, start=1):
+        text = seg.text.strip()
+        if not text:
+            continue
+        lines.append(f"[{ts(seg.start)}] {text}")
+        srt.append(f"{i}\n{ts(seg.start, True)} --> {ts(seg.end, True)}\n{text}\n")
+        print(f"\r  transcribed to {ts(seg.end)} / {ts(info.duration)}", end="", flush=True)
+    print()
+
+    header = (f"Transcript: {path.name}\nDuration: {ts(info.duration)}\n"
+              f"Language: {info.language}\n{'-' * 60}\n")
+    body = "\n".join(lines)
+    (outdir / f"{path.stem}.txt").write_text(header + body + "\n", encoding="utf-8")
+    (outdir / f"{path.stem}.srt").write_text("\n".join(srt), encoding="utf-8")
+    print(f"  done in {time.time() - t0:.0f}s -> {path.stem}.txt / .srt")
+    return header + body
+
+
+def grab_frames(path: Path, outdir: Path, every: int):
+    import av
+    fdir = outdir / f"{path.stem}_frames"
+    fdir.mkdir(exist_ok=True)
+    next_t, n = 0.0, 0
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        stream.codec_context.skip_frame = "NONKEY"   # keyframes only = fast
+        for frame in container.decode(stream):
+            t = float(frame.pts * stream.time_base) if frame.pts is not None else 0
+            if t + 0.5 >= next_t:
+                frame.to_image().save(fdir / f"{ts(t).replace(':', '-')}.png")
+                n += 1
+                next_t = t + every
+    print(f"  saved {n} screenshot(s) -> {fdir.name}\\")
+
+
+def main():
+    p = argparse.ArgumentParser(description="Offline transcripts for screen recordings.")
+    p.add_argument("paths", nargs="+", help="video files and/or folders")
+    p.add_argument("--model", default="small", help="tiny|base|small|medium|large-v3")
+    p.add_argument("--language", default="en", help="e.g. en; use 'auto' to detect")
+    p.add_argument("--device", default="auto", help="auto|cpu|cuda")
+    p.add_argument("--frames", type=int, default=0, help="screenshot every N seconds")
+    p.add_argument("--out", help="output folder (default: next to each video)")
+    p.add_argument("--skip-existing", action="store_true", help="skip videos that already have a .txt")
+    a = p.parse_args()
+
+    files = []
+    for raw in a.paths:
+        pth = Path(raw)
+        if pth.is_dir():
+            files += sorted(f for f in pth.iterdir() if f.suffix.lower() in VIDEO_EXT)
+        elif pth.suffix.lower() in VIDEO_EXT:
+            files.append(pth)
+    if not files:
+        sys.exit("No video/audio files found.")
+
+    from faster_whisper import WhisperModel
+    compute = "int8"  # good speed/accuracy on CPU; cuda will upgrade automatically
+    print(f"Loading model '{a.model}' (first run downloads it)…")
+    model = WhisperModel(a.model, device=a.device, compute_type=compute)
+
+    combined = []
+    for i, f in enumerate(files, start=1):
+        outdir = Path(a.out) if a.out else f.parent
+        outdir.mkdir(parents=True, exist_ok=True)
+        print(f"\n[{i}/{len(files)}] {f.name}")
+        if a.skip_existing and (outdir / f"{f.stem}.txt").exists():
+            print("  already transcribed, skipping")
+            combined.append((outdir / f"{f.stem}.txt").read_text(encoding="utf-8"))
+            continue
+        try:
+            combined.append(transcribe(model, f, outdir, None if a.language == "auto" else a.language))
+            if a.frames:
+                grab_frames(f, outdir, a.frames)
+        except Exception as e:
+            print(f"  ! failed: {type(e).__name__}: {e}")
+
+    if len(combined) > 1:
+        out = (Path(a.out) if a.out else files[0].parent) / "ALL_TRANSCRIPTS.md"
+        out.write_text("\n\n\n".join(combined), encoding="utf-8")
+        print(f"\nCombined transcript -> {out}")
+
+
+if __name__ == "__main__":
+    main()
