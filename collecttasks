@@ -1,0 +1,62 @@
+<#
+collect_tasks.ps1 -- export PowerShell-based scheduled tasks + the scripts they run,
+from one or more servers, into a folder the Python analyzer can read.
+
+Output layout:
+  <OutDir>\<SERVER>\tasks\<TaskName>.xml
+  <OutDir>\<SERVER>\scripts\<script>.ps1
+
+Usage:
+  .\collect_tasks.ps1 -Servers srv01,srv02 -OutDir C:\temp\task_audit
+  .\collect_tasks.ps1 -Servers (Get-Content servers.txt) -OutDir C:\temp\task_audit
+  .\collect_tasks.ps1 -OutDir C:\temp\task_audit          # local machine only
+
+Read-only: it exports task definitions and copies script files; it changes nothing.
+#>
+param(
+    [string[]]$Servers = @($env:COMPUTERNAME),
+    [Parameter(Mandatory)][string]$OutDir,
+    [string]$TaskPathFilter = "*"      # e.g. "\MyCompany\*" to limit folders
+)
+
+foreach ($srv in $Servers) {
+    Write-Host "== $srv"
+    $taskDir   = Join-Path $OutDir "$srv\tasks"
+    $scriptDir = Join-Path $OutDir "$srv\scripts"
+    New-Item -ItemType Directory -Force -Path $taskDir, $scriptDir | Out-Null
+
+    try {
+        $cim = if ($srv -eq $env:COMPUTERNAME) { $null } else { New-CimSession -ComputerName $srv -ErrorAction Stop }
+        $tasks = Get-ScheduledTask -CimSession $cim -TaskPath $TaskPathFilter -ErrorAction Stop |
+                 Where-Object { $_.TaskPath -notlike '\Microsoft\*' }
+    } catch {
+        Write-Warning "  cannot query $srv : $_"
+        continue
+    }
+
+    foreach ($t in $tasks) {
+        $ps = $t.Actions | Where-Object { $_.Execute -match 'powershell|pwsh' -or $_.Arguments -match '\.ps1' }
+        if (-not $ps) { continue }
+
+        $safe = ($t.TaskPath + $t.TaskName).Trim('\') -replace '[\\/:*?"<>|]', '_'
+        Export-ScheduledTask -CimSession $cim -TaskName $t.TaskName -TaskPath $t.TaskPath |
+            Out-File (Join-Path $taskDir "$safe.xml") -Encoding utf8
+        Write-Host "  task: $($t.TaskPath)$($t.TaskName)"
+
+        foreach ($a in $ps) {
+            if ($a.Arguments -match '(?i)-File\s+"?([^"]+?\.ps1)"?(\s|$)' -or
+                $a.Arguments -match '(?i)"?([A-Z]:\\[^"]+?\.ps1)"?') {
+                $local = $Matches[1]
+                $unc = if ($srv -eq $env:COMPUTERNAME) { $local }
+                       else { "\\$srv\" + ($local -replace '^([A-Za-z]):', '$1$') }
+                try {
+                    Copy-Item -LiteralPath $unc -Destination $scriptDir -Force -ErrorAction Stop
+                    Write-Host "    script: $local"
+                } catch { Write-Warning "    could not copy $unc : $_" }
+            }
+        }
+    }
+    if ($cim) { Remove-CimSession $cim }
+}
+Write-Host "`nDone. Run:  python ps_consolidate.py `"$OutDir`""
+
