@@ -1,0 +1,465 @@
+"""
+ps_consolidate.py -- analyze a set of PowerShell scripts (and optionally the
+Task Scheduler tasks that run them) and report consolidation opportunities.
+
+What it finds
+  * Duplicates              scripts that are (nearly) identical
+  * Parameterize            same logic, only values differ (servers, paths, dates)
+                            -> one script with parameters; lists the differing values
+  * Similar                 overlapping logic worth merging / refactoring
+  * Shared functions        same function copied into several scripts -> put in a module
+  * Same script, many hosts the same script scheduled on several servers
+                            -> run once centrally with -ComputerName / Invoke-Command
+  * Schedule overlap        tasks on a server firing at the same time / back-to-back
+  * Security flags          hard-coded passwords, plaintext SecureString, etc.
+  * Inventory               cmdlets, modules, servers, UNC paths, outputs per script
+
+Input (any of these)
+  * a folder of .ps1 files (searched recursively)
+  * output of collect_tasks.ps1  (<dir>\\<SERVER>\\tasks\\*.xml + <dir>\\<SERVER>\\scripts\\*.ps1)
+  * --paste : paste scripts into the console, each starting with a line  ### name.ps1
+
+Output
+  consolidation_report.xlsx   detailed sheets
+  CONSOLIDATION_REPORT.md     readable summary (easy to hand to Claude for a 2nd opinion)
+
+Usage
+  python ps_consolidate.py C:\\temp\\task_audit
+  python ps_consolidate.py C:\\Scripts --threshold 0.75
+  python ps_consolidate.py --paste
+Requires: pip install pandas openpyxl
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import itertools
+import os
+import re
+import sys
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+from difflib import SequenceMatcher
+from pathlib import Path
+
+TASK_NS = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+
+
+# --------------------------------------------------------------------------- #
+# Loading
+# --------------------------------------------------------------------------- #
+def read_text(p: Path) -> str:
+    raw = p.read_bytes()
+    for enc in ("utf-8-sig", "utf-16", "cp1252"):
+        try:
+            txt = raw.decode(enc)
+            if enc == "utf-16" and not raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+                continue
+            return txt
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def server_of(path: Path, root: Path) -> str:
+    """collect_tasks layout: root/SERVER/(scripts|tasks)/file"""
+    try:
+        rel = path.relative_to(root).parts
+        if len(rel) >= 3 and rel[-2].lower() in ("scripts", "tasks"):
+            return rel[-3]
+    except ValueError:
+        pass
+    return ""
+
+
+def load_scripts(root: Path):
+    scripts = []
+    for p in sorted(root.rglob("*.ps1")) + sorted(root.rglob("*.psm1")):
+        scripts.append({"id": f"{server_of(p, root) + ':' if server_of(p, root) else ''}{p.name}",
+                        "name": p.name, "server": server_of(p, root), "path": str(p),
+                        "code": read_text(p)})
+    return scripts
+
+
+def load_pasted():
+    print("Paste scripts. Start each with a line like:  ### backup_logs.ps1\n"
+          "Finish with a line containing only  END  (or Ctrl+Z / Ctrl+D).")
+    scripts, name, buf = [], None, []
+    def flush():
+        if name and buf:
+            scripts.append({"id": name, "name": name, "server": "", "path": "(pasted)",
+                            "code": "\n".join(buf)})
+    for line in sys.stdin:
+        line = line.rstrip("\n")
+        if line.strip() == "END":
+            break
+        m = re.match(r"^\s*###\s*(.+?)\s*$", line)
+        if m:
+            flush()
+            name, buf = m.group(1), []
+        else:
+            buf.append(line)
+    flush()
+    return scripts
+
+
+def load_tasks(root: Path):
+    tasks = []
+    for x in sorted(root.rglob("*.xml")):
+        try:
+            txt = re.sub(r"^\s*<\?xml[^>]*\?>", "", read_text(x))
+            tree = ET.fromstring(txt)
+        except Exception:
+            continue
+        if not tree.tag.endswith("Task"):
+            continue
+        g = lambda path: (tree.findtext(path, default="", namespaces=TASK_NS) or "").strip()
+        uri = g("t:RegistrationInfo/t:URI") or x.stem
+        execs = []
+        for ex in tree.findall("t:Actions/t:Exec", TASK_NS):
+            cmd = ex.findtext("t:Command", default="", namespaces=TASK_NS)
+            args = ex.findtext("t:Arguments", default="", namespaces=TASK_NS)
+            execs.append(f"{cmd} {args}".strip())
+        action = " | ".join(execs)
+        m = re.search(r"([^\\/\"' ]+\.ps1)", action, re.I)
+        triggers = []
+        trg_root = tree.find("t:Triggers", TASK_NS)
+        for trg in (list(trg_root) if trg_root is not None else []):
+            kind = trg.tag.split("}")[-1]
+            start = trg.findtext("t:StartBoundary", default="", namespaces=TASK_NS)
+            rep = trg.findtext("t:Repetition/t:Interval", default="", namespaces=TASK_NS)
+            days = trg.find("t:ScheduleByDay", TASK_NS)
+            week = trg.find("t:ScheduleByWeek", TASK_NS)
+            desc = kind.replace("Trigger", "")
+            if days is not None:
+                desc = f"Daily/{days.findtext('t:DaysInterval', default='1', namespaces=TASK_NS)}d"
+            elif week is not None:
+                dw = week.find("t:DaysOfWeek", TASK_NS)
+                desc = "Weekly " + ",".join(c.tag.split('}')[-1][:3] for c in (list(dw) if dw is not None else []))
+            time = start[11:16] if len(start) >= 16 else ""
+            triggers.append({"desc": desc, "time": time, "repeat": rep})
+        tasks.append({
+            "server": server_of(x, root), "task": uri,
+            "enabled": g("t:Settings/t:Enabled") or "true",
+            "run_as": g("t:Principals/t:Principal/t:UserId"),
+            "action": action, "script": m.group(1) if m else "",
+            "schedule": "; ".join(f"{t['desc']} {t['time']}{' every ' + t['repeat'] if t['repeat'] else ''}"
+                                  for t in triggers),
+            "times": [t["time"] for t in triggers if t["time"]],
+        })
+    return tasks
+
+
+# --------------------------------------------------------------------------- #
+# Normalization
+# --------------------------------------------------------------------------- #
+STR_RE = re.compile(r'"(?:[^"`]|`.)*"|\'(?:[^\']|\'\')*\'')
+NUM_RE = re.compile(r"\b\d+(\.\d+)?\b")
+
+
+def strip_comments(code: str) -> str:
+    code = re.sub(r"<#.*?#>", "", code, flags=re.S)
+    out = []
+    for line in code.splitlines():
+        # drop "# comment" that isn't inside a string (cheap but effective heuristic)
+        masked = STR_RE.sub(lambda m: "x" * len(m.group(0)), line)
+        i = masked.find("#")
+        out.append(line[:i] if i >= 0 else line)
+    return "\n".join(out)
+
+
+def norm_lines(code: str, template=False):
+    code = strip_comments(code)
+    if template:
+        code = STR_RE.sub("STR", code)
+        code = NUM_RE.sub("NUM", code)
+    lines = []
+    for l in code.splitlines():
+        l = re.sub(r"\s+", " ", l).strip().lower()
+        if l and l not in ("{", "}"):
+            lines.append(l)
+    return lines
+
+
+def literals(code: str):
+    """String literals plus numeric literals (e.g. retention days) -- the 'values' of a script."""
+    code = strip_comments(code)
+    strs = {m.group(0) for m in STR_RE.finditer(code)}
+    masked = STR_RE.sub(" ", code)
+    nums = {m.group(0) for m in NUM_RE.finditer(masked) if m.group(0) not in ("0", "1")}
+    return strs | nums
+
+
+# --------------------------------------------------------------------------- #
+# Analysis
+# --------------------------------------------------------------------------- #
+FUNC_RE = re.compile(r"(?im)^\s*function\s+([\w\-:]+)\s*(\([^)]*\))?\s*\{")
+CMDLET_RE = re.compile(r"\b([A-Z][a-z]+-[A-Z][A-Za-z]+)\b")
+UNC_RE = re.compile(r"\\\\[A-Za-z0-9_.\-]+\\[^\s\"'`|;,)]+")
+SERVER_RE = re.compile(r"(?i)-ComputerName\s+[\"']?([A-Za-z0-9_.\-]+)")
+OUT_RE = re.compile(r"(?i)(?:Out-File|Export-Csv|Set-Content|Add-Content|Export-Clixml)\b[^\n|]*?"
+                    r"(?:-(?:FilePath|Path|LiteralPath)\s+)?[\"']([^\"']+)[\"']")
+SECRET_PATTERNS = [
+    (r"(?i)\$\w*(password|passwd|pwd|pw|pass|secret|apikey|token)\w*\s*=\s*[\"'][^\"']{3,}[\"']", "hard-coded secret in variable"),
+    (r"(?i)ConvertTo-SecureString\s+[\"'][^\"']+[\"']\s+-AsPlainText", "plaintext password -> SecureString"),
+    (r"(?i)-Password\s+[\"'][^\"']+[\"']", "password passed as literal"),
+    (r"(?i)net\s+use\s+\S+\s+\S+\s+/user:", "net use with inline credentials"),
+    (r"(?i)Invoke-Expression|\biex\b", "Invoke-Expression (injection risk)"),
+    (r"(?i)-ExecutionPolicy\s+Bypass", "ExecutionPolicy Bypass"),
+]
+
+
+def extract_functions(code: str):
+    funcs = []
+    for m in FUNC_RE.finditer(code):
+        i, depth = m.end(), 1
+        while i < len(code) and depth:
+            depth += {"{": 1, "}": -1}.get(code[i], 0)
+            i += 1
+        body = code[m.start():i]
+        norm = "\n".join(norm_lines(body))
+        funcs.append({"name": m.group(1), "lines": body.count("\n") + 1,
+                      "hash": hashlib.md5(norm.encode()).hexdigest()[:10]})
+    return funcs
+
+
+def inventory(s):
+    code = strip_comments(s["code"])
+    return {
+        "script": s["id"], "server": s["server"], "lines": len(norm_lines(s["code"])),
+        "cmdlets": ", ".join(sorted(set(CMDLET_RE.findall(code)))),
+        "modules": ", ".join(sorted(set(re.findall(r"(?i)Import-Module\s+[\"']?([\w.\-]+)", code)))),
+        "target_servers": ", ".join(sorted(set(SERVER_RE.findall(code)))),
+        "unc_paths": ", ".join(sorted(set(UNC_RE.findall(code))))[:1000],
+        "outputs": ", ".join(sorted(set(OUT_RE.findall(code))))[:1000],
+        "sends_email": "yes" if re.search(r"(?i)Send-MailMessage|Net\.Mail", code) else "",
+        "functions": ", ".join(f["name"] for f in extract_functions(s["code"])),
+    }
+
+
+def compare(scripts, threshold):
+    pairs = []
+    norm = {s["id"]: norm_lines(s["code"]) for s in scripts}
+    tmpl = {s["id"]: norm_lines(s["code"], template=True) for s in scripts}
+    for a, b in itertools.combinations(scripts, 2):
+        ra = SequenceMatcher(None, norm[a["id"]], norm[b["id"]], autojunk=False).ratio()
+        ta = SequenceMatcher(None, tmpl[a["id"]], tmpl[b["id"]], autojunk=False).ratio()
+        if max(ra, ta) < threshold:
+            continue
+        if ra >= 0.98:
+            verdict = "DUPLICATE"
+            advice = "Keep one copy; point both tasks at it."
+        elif ta >= 0.95:
+            verdict = "PARAMETERIZE"
+            advice = "Same logic, different values -> one script with parameters."
+        else:
+            verdict = "SIMILAR"
+            advice = "Overlapping logic -> merge or extract shared functions."
+        la, lb = literals(a["code"]), literals(b["code"])
+        only_a, only_b = sorted(la - lb), sorted(lb - la)
+        pairs.append({
+            "script_a": a["id"], "script_b": b["id"], "verdict": verdict,
+            "exact_similarity": round(ra * 100, 1), "logic_similarity": round(ta * 100, 1),
+            "values_only_in_a": " | ".join(only_a)[:1500], "values_only_in_b": " | ".join(only_b)[:1500],
+            "advice": advice,
+        })
+    return sorted(pairs, key=lambda p: (-p["logic_similarity"], -p["exact_similarity"]))
+
+
+def clusters(scripts, pairs):
+    parent = {s["id"]: s["id"] for s in scripts}
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for p in pairs:
+        parent[find(p["script_a"])] = find(p["script_b"])
+    groups = defaultdict(list)
+    for s in scripts:
+        groups[find(s["id"])].append(s["id"])
+    out = []
+    for n, members in enumerate(sorted((g for g in groups.values() if len(g) > 1), key=len, reverse=True), 1):
+        verdicts = {p["verdict"] for p in pairs if p["script_a"] in members and p["script_b"] in members}
+        best = ("DUPLICATE" if verdicts == {"DUPLICATE"} else
+                "PARAMETERIZE" if verdicts <= {"DUPLICATE", "PARAMETERIZE"} else "SIMILAR")
+        out.append({"cluster": n, "size": len(members), "verdict": best,
+                    "scripts": ", ".join(sorted(members))})
+    return out
+
+
+def shared_functions(scripts):
+    by_hash, by_name = defaultdict(list), defaultdict(set)
+    for s in scripts:
+        for f in extract_functions(s["code"]):
+            by_hash[(f["name"].lower(), f["hash"])].append((s["id"], f["lines"]))
+            by_name[f["name"].lower()].add(f["hash"])
+    rows = []
+    for (name, h), uses in by_hash.items():
+        if len(uses) > 1:
+            rows.append({"function": name, "copies": len(uses), "lines_each": uses[0][1],
+                         "identical": "yes", "scripts": ", ".join(u[0] for u in uses),
+                         "advice": "Move into a shared .psm1 module and Import-Module it."})
+    for name, hashes in by_name.items():
+        if len(hashes) > 1:
+            users = [u[0] for (n, h), us in by_hash.items() if n == name for u in us]
+            rows.append({"function": name, "copies": len(users), "lines_each": "",
+                         "identical": f"no ({len(hashes)} versions)", "scripts": ", ".join(users),
+                         "advice": "Same name, drifted copies -> reconcile into one version."})
+    return sorted(rows, key=lambda r: -r["copies"])
+
+
+def security(scripts):
+    rows = []
+    for s in scripts:
+        for n, line in enumerate(s["code"].splitlines(), 1):
+            for pat, label in SECRET_PATTERNS:
+                if re.search(pat, line):
+                    masked = re.sub(r"([\"'])[^\"']{2,}([\"'])", r"\1****\2", line.strip())
+                    rows.append({"script": s["id"], "line": n, "issue": label, "code": masked[:300]})
+    return rows
+
+
+def schedule_findings(tasks, pairs):
+    rows = []
+    by_script = defaultdict(list)
+    for t in tasks:
+        if t["script"]:
+            by_script[t["script"].lower()].append(t)
+    for sc, ts in by_script.items():
+        servers = sorted({t["server"] for t in ts if t["server"]})
+        if len(servers) > 1:
+            rows.append({"type": "SAME SCRIPT ON MANY SERVERS", "detail": sc,
+                         "servers": ", ".join(servers),
+                         "advice": "Run once from a central job server, looping Invoke-Command -ComputerName."})
+    similar = {(p["script_a"].split(":")[-1].lower(), p["script_b"].split(":")[-1].lower()) for p in pairs}
+    by_server = defaultdict(list)
+    for t in tasks:
+        by_server[t["server"]].append(t)
+    for srv, ts in by_server.items():
+        for a, b in itertools.combinations(ts, 2):
+            shared = set(a["times"]) & set(b["times"])
+            near = any(abs(_mins(x) - _mins(y)) <= 15 for x in a["times"] for y in b["times"])
+            if not (shared or near):
+                continue
+            rel = ((a["script"].lower(), b["script"].lower()) in similar or
+                   (b["script"].lower(), a["script"].lower()) in similar)
+            rows.append({"type": "SAME TIME" if shared else "BACK-TO-BACK (<=15 min)",
+                         "detail": f"{a['task']}  +  {b['task']}", "servers": srv,
+                         "advice": ("Scripts are similar AND run together -> strong merge candidate."
+                                    if rel else "Consider one task running both steps in sequence "
+                                                "(clear ordering, one log, one alert).")})
+    return rows
+
+
+def _mins(hhmm):
+    try:
+        h, m = hhmm.split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return -999
+
+
+# --------------------------------------------------------------------------- #
+# Reporting
+# --------------------------------------------------------------------------- #
+def write_reports(out_dir, scripts, tasks, pairs, clus, funcs, sec, sched, inv):
+    import pandas as pd
+    xlsx = Path(out_dir) / "consolidation_report.xlsx"
+    sheets = {"Clusters": clus, "Similar_Pairs": pairs, "Shared_Functions": funcs,
+              "Schedule": sched, "Security_Flags": sec, "Tasks": tasks, "Inventory": inv}
+    with pd.ExcelWriter(xlsx, engine="openpyxl") as xw:
+        summary = [
+            {"metric": "Scripts analyzed", "value": len(scripts)},
+            {"metric": "Scheduled tasks found", "value": len(tasks)},
+            {"metric": "Duplicate pairs", "value": sum(p["verdict"] == "DUPLICATE" for p in pairs)},
+            {"metric": "Parameterize pairs", "value": sum(p["verdict"] == "PARAMETERIZE" for p in pairs)},
+            {"metric": "Similar pairs", "value": sum(p["verdict"] == "SIMILAR" for p in pairs)},
+            {"metric": "Consolidation clusters", "value": len(clus)},
+            {"metric": "Scripts that could disappear",
+             "value": sum(c["size"] - 1 for c in clus if c["verdict"] != "SIMILAR")},
+            {"metric": "Functions copied across scripts", "value": len(funcs)},
+            {"metric": "Security flags", "value": len(sec)},
+        ]
+        pd.DataFrame(summary).to_excel(xw, sheet_name="Summary", index=False)
+        for name, rows in sheets.items():
+            df = pd.DataFrame(rows)
+            if "times" in df.columns:
+                df = df.drop(columns="times")
+            (df if not df.empty else pd.DataFrame({"(none found)": []})).to_excel(xw, sheet_name=name, index=False)
+        for ws in xw.book.worksheets:
+            ws.freeze_panes = "A2"
+            for col in ws.columns:
+                w = max((len(str(c.value)) for c in list(col)[:100] if c.value is not None), default=10)
+                ws.column_dimensions[col[0].column_letter].width = min(max(w + 2, 10), 70)
+
+    md = [f"# PowerShell consolidation report\n",
+          f"- Scripts analyzed: **{len(scripts)}**   Tasks: **{len(tasks)}**",
+          f"- Clusters: **{len(clus)}**   Scripts that could be eliminated: "
+          f"**{sum(c['size'] - 1 for c in clus if c['verdict'] != 'SIMILAR')}**",
+          f"- Shared functions: **{len(funcs)}**   Security flags: **{len(sec)}**\n"]
+    if clus:
+        md.append("## Consolidation clusters")
+        for c in clus:
+            md.append(f"- **#{c['cluster']} {c['verdict']}** ({c['size']}): {c['scripts']}")
+    if pairs:
+        md.append("\n## Top similar pairs")
+        for p in pairs[:25]:
+            md.append(f"- {p['verdict']}: `{p['script_a']}` vs `{p['script_b']}` "
+                      f"(logic {p['logic_similarity']}%, exact {p['exact_similarity']}%)")
+            if p["verdict"] == "PARAMETERIZE":
+                md.append(f"  - differing values: {p['values_only_in_a'][:200]}  ⟷  {p['values_only_in_b'][:200]}")
+    if funcs:
+        md.append("\n## Functions to move into a shared module")
+        for f in funcs[:25]:
+            md.append(f"- `{f['function']}` — {f['copies']} copies, identical: {f['identical']}")
+    if sched:
+        md.append("\n## Scheduling")
+        for s in sched[:25]:
+            md.append(f"- {s['type']}: {s['detail']} ({s['servers']}) — {s['advice']}")
+    if sec:
+        md.append("\n## Security flags")
+        for s in sec[:40]:
+            md.append(f"- `{s['script']}` line {s['line']}: {s['issue']}")
+    (Path(out_dir) / "CONSOLIDATION_REPORT.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    return xlsx
+
+
+def main():
+    p = argparse.ArgumentParser(description="Find consolidation opportunities in PowerShell scripts.")
+    p.add_argument("root", nargs="?", help="folder with .ps1 files and/or collect_tasks.ps1 output")
+    p.add_argument("--paste", action="store_true", help="paste scripts into the console instead")
+    p.add_argument("--threshold", type=float, default=0.70, help="min similarity to report (0-1)")
+    p.add_argument("-o", "--out", default=".", help="output folder")
+    a = p.parse_args()
+
+    if a.paste:
+        scripts, tasks = load_pasted(), []
+    elif a.root:
+        root = Path(a.root)
+        scripts, tasks = load_scripts(root), load_tasks(root)
+    else:
+        p.error("give a folder or use --paste")
+    if len(scripts) < 1:
+        sys.exit("No scripts found.")
+
+    print(f"{len(scripts)} script(s), {len(tasks)} task(s). Comparing…")
+    pairs = compare(scripts, a.threshold)
+    clus = clusters(scripts, pairs)
+    funcs = shared_functions(scripts)
+    sec = security(scripts)
+    sched = schedule_findings(tasks, pairs)
+    inv = [inventory(s) for s in scripts]
+    os.makedirs(a.out, exist_ok=True)
+    xlsx = write_reports(a.out, scripts, tasks, pairs, clus, funcs, sec, sched, inv)
+
+    print(f"\n  clusters: {len(clus)} | pairs: {len(pairs)} | shared functions: {len(funcs)} | "
+          f"schedule findings: {len(sched)} | security flags: {len(sec)}")
+    for c in clus[:10]:
+        print(f"  #{c['cluster']} {c['verdict']:<12} {c['scripts']}")
+    print(f"\nReports: {xlsx.resolve()}\n         {(Path(a.out) / 'CONSOLIDATION_REPORT.md').resolve()}")
+
+
+if __name__ == "__main__":
+    main()
