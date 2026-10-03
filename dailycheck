@@ -1,0 +1,35 @@
+# refresh-admin-cred.ps1
+$user    = "DOMAIN\adm_gagan"                     # your admin account
+$servers = Get-Content "$PSScriptRoot\servers.txt" # one hostname per line
+
+$sec   = Read-Host "Admin password" -AsSecureString
+$plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+           [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+
+foreach ($s in $servers) {
+    cmdkey /generic:"TERMSRV/$s" /user:$user /pass:$plain | Out-Null
+    Write-Host "updated $s"
+}
+$plain = $null
+
+
+
+
+1. Let ASG use what cmdkey already stores (test this first). ASG is built on Microsoft's RDP control, which can pick up TERMSRV/<server> entries from Windows Credential Manager when the connection itself has no credentials set. To test:
+
+Clear the saved credentials on one ASG connection.
+Make sure cmdkey /list shows TERMSRV/thatserver.
+Connect.
+
+If it logs straight in, you only ever update cmdkey, and the script below handles that daily.
+
+2. Use one shared credential object in ASG. ASG lets you create a credential object and have all connections reference it, through folder inheritance or by assigning it. Your daily update then becomes a single 10-second edit in one place, not per connection. That's the low-tech fix if option 1 doesn't work.
+
+3. UI automation. A pywinauto script could open that credential object and paste the new password. It works, but it breaks whenever ASG updates its UI. I'd only build it if options 1 and 2 both fail.
+
+Daily cmdkey refresh. This prompts once, never writes the password to disk, and updates every server:
+
+You can trigger it from a desktop shortcut or a Task Scheduler task at logon. It has to be interactive, because a scheduled task can't know the new password.
+
+If the password changes daily because a PAM tool like CyberArk rotates it, that rotation is a deliberate control. Caching it locally in cmdkey or ASG may conflict with the policy behind it. If your shop has CyberArk PSM or a PAM connector for RDP, that's the sanctioned way to get the same convenience.
+  
