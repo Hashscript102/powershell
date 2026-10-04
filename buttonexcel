@@ -1,0 +1,12 @@
+What the report tells you (Excel, plus a markdown summary). In my test, with 4 scripts on 2 servers, it found all of these:
+
+DUPLICATE: identical scripts. Keep one copy.
+PARAMETERIZE: same logic with different values, and it lists the values. For example App1 | 30 vs App2 | 14 shows that two log-cleanup scripts could become one script with -Path and -Days parameters.
+SIMILAR: overlapping logic worth merging.
+Shared functions: helpers like Write-Log copied into many scripts, which belong in one .psm1 module. It also catches copies that have drifted apart.
+Same script on many servers: run it once from a central server with Invoke-Command -ComputerName instead of scheduling it everywhere.
+Schedule overlap: tasks firing at the same time or within 15 minutes of each other, flagged as a strong merge candidate when the scripts are also similar.
+Security flags: hardcoded passwords and plaintext SecureString values. Passwords are masked in the report.
+Inventory: cmdlets, modules, target servers, UNC paths, output files and email usage per script.
+
+The analyzer handles the mechanical comparison. Once it shows which scripts belong together, CONSOLIDATION_REPORT.md plus those scripts with server names and passwords scrubbed is a good thing to bring to me to draft the merged, parameterized version.
